@@ -2,6 +2,7 @@ module Test.Fuzz exposing (fuzzTest)
 
 import DebugConfig
 import Dict exposing (Dict)
+import Exhaustive exposing (Frontier)
 import Fuzz.Internal exposing (Fuzzer)
 import GenResult exposing (GenResult(..))
 import MicroDictExtra as Dict
@@ -61,8 +62,12 @@ validatedFuzzTest desc fuzzer getExpectation maybeRuns distribution =
                                 , initialSeed = seed
                                 , runsNeeded = runs
                                 , distribution = distribution
+                                , frontierCap = frontierCap
                                 }
-                                (initLoopState seed distribution)
+                                (initLoopState seed
+                                    distribution
+                                    (shouldEnumerate runs distribution fuzzer)
+                                )
             in
             case failure of
                 Nothing ->
@@ -148,6 +153,11 @@ type alias LoopConstants a =
     , initialSeed : Random.Seed
     , runsNeeded : Int
     , distribution : Distribution a
+
+    {- Give up on enumerating once the frontier is this wide. A wide frontier
+       means a wide tree, which means we were never going to finish it.
+    -}
+    , frontierCap : Int
     }
 
 
@@ -157,11 +167,138 @@ type alias LoopState =
     , nextPowerOfTwo : Int
     , failure : Maybe Failure
     , currentSeed : Random.Seed
+
+    {- `Nothing` once we've stopped enumerating, either because the tree was
+       exhausted or because it was too wide to bother with.
+    -}
+    , frontier : Maybe Frontier
+
+    {- True once enumeration has covered the entire space of choices, so there is
+       provably nothing left to test and the loop can stop early however large
+       the requested run count was.
+    -}
+    , exhausted : Bool
+
+    {- Whether any enumerated value was generated at all. If every one was
+       rejected then the fuzzer really is invalid and we should say so, rather
+       than silently passing a test that never ran.
+    -}
+    , anyGenerated : Bool
     }
 
 
-initLoopState : Random.Seed -> Distribution a -> LoopState
-initLoopState initialSeed distribution =
+{-| Enumeration gives up once the frontier is this wide.
+
+Small on purpose. The point is to spend a negligible number of runs discovering
+that a tree is too big, not to make a good attempt at a big one -- `Fuzz.list
+Fuzz.int` exceeds this within a handful of nodes. The values it did test before
+giving up are the smallest ones, which are worth testing anyway.
+
+-}
+frontierCap : Int
+frontierCap =
+    64
+
+
+{-| The most nodes we'll generate while deciding whether to enumerate.
+
+Bounded so the decision can never cost much. Trees larger than this are sampled
+instead, which gives up the chance to _prove_ a property over a mid-sized domain
+in exchange for never regressing: walking a 961-node tree currently costs about
+four times what sampling 1000 values does, because the enumerator allocates lists
+per node. Worth revisiting once that's cheaper.
+
+-}
+maxEnumerationNodes : Int
+maxEnumerationNodes =
+    64
+
+
+{-| Decide up front whether to walk the fuzzer's choice tree or sample randomly.
+
+Generates values without testing any of them, which is what makes this safe: for
+any fuzzer we end up sampling, the values tested are exactly the ones we would
+have tested before, so a fixed seed keeps its existing meaning. Deciding as we go
+instead would have every fuzz test try the all-zeros input first -- and not only
+the ones that benefit. `Fuzz.string`'s all-zeros run answers its first
+"another character?" coin with "no", so a single-path size estimate says the tree
+has two leaves, and we'd test `""` before discovering otherwise.
+
+The cost is small because the size estimate rejects hopeless trees on the first
+node: `Fuzz.int` is refused after one generation, `Fuzz.string` after two. Only
+trees that really are small are walked all the way.
+
+Two reasons to refuse outright:
+
+  - A distribution check is a statistical statement about a random sample, and an
+    enumeration isn't one. `weightedBool 0.9` has two possible runs, so
+    enumerating it reports 50/50 where the fuzzer's real distribution is 90/10 --
+    every percentage in the report would be wrong.
+  - A tree bigger than the requested run count can't be finished, so walking it
+    would be a slower way of testing fewer values.
+
+-}
+shouldEnumerate : Int -> Distribution a -> Fuzzer a -> Bool
+shouldEnumerate runsNeeded distribution fuzzer =
+    case distribution of
+        NoDistributionNeeded ->
+            planEnumeration runsNeeded
+                fuzzer
+                (min runsNeeded maxEnumerationNodes)
+                Exhaustive.initialFrontier
+                []
+
+        _ ->
+            False
+
+
+{-| Walk the tree without testing anything, reporting whether it can be finished
+within the node budget.
+-}
+planEnumeration : Int -> Fuzzer a -> Int -> Frontier -> List Int -> Bool
+planEnumeration runsNeeded fuzzer nodesLeft frontier prefix =
+    if nodesLeft <= 0 then
+        False
+
+    else
+        let
+            prng : PRNG.PRNG
+            prng =
+                Fuzz.Internal.generate
+                    (PRNG.enumerating (RandomRun.fromList prefix))
+                    fuzzer
+                    |> GenResult.getPrng
+
+            newFrontier : Frontier
+            newFrontier =
+                Exhaustive.enqueue
+                    (Exhaustive.expansionsOf
+                        (List.length prefix)
+                        (PRNG.getRun prng)
+                        (PRNG.getMaxes prng)
+                    )
+                    frontier
+        in
+        if
+            Exhaustive.size newFrontier
+                > frontierCap
+                || Exhaustive.estimatedTreeSize (runsNeeded + 1) (PRNG.getMaxes prng)
+                > runsNeeded
+        then
+            False
+
+        else
+            case Exhaustive.next newFrontier of
+                Nothing ->
+                    -- Frontier emptied: the whole tree fits in the budget.
+                    True
+
+                Just ( nextPrefix, rest ) ->
+                    planEnumeration runsNeeded fuzzer (nodesLeft - 1) rest nextPrefix
+
+
+initLoopState : Random.Seed -> Distribution a -> Bool -> LoopState
+initLoopState initialSeed distribution enumerate =
     let
         initialDistributionCount : Maybe (Dict (List String) Int)
         initialDistributionCount =
@@ -179,6 +316,14 @@ initLoopState initialSeed distribution =
     , nextPowerOfTwo = 1
     , failure = Nothing
     , currentSeed = initialSeed
+    , frontier =
+        if enumerate then
+            Just Exhaustive.initialFrontier
+
+        else
+            Nothing
+    , exhausted = False
+    , anyGenerated = False
     }
 
 
@@ -230,7 +375,35 @@ fuzzLoop c state =
             }
 
         Nothing ->
-            if state.runsElapsed < c.runsNeeded then
+            if state.exhausted && not state.anyGenerated then
+                {- Enumeration covered the whole tree and every single node was
+                   rejected, so the fuzzer can't produce a value at all. Passing
+                   here would be reporting success for a test that never ran.
+                -}
+                { distributionReport = Fuzz.Internal.noDistribution
+                , failure =
+                    Just
+                        { given = Nothing
+                        , randomRun = RandomRun.empty
+                        , failData =
+                            { description = "Fuzzer could not generate any value"
+                            , reason = Invalid InvalidFuzzer
+                            }
+                        }
+                , runsElapsed = state.runsElapsed
+                }
+
+            else if state.exhausted then
+                {- The property held for every input the fuzzer can produce.
+                   There is nothing left to test, so honour that rather than the
+                   requested run count.
+                -}
+                { distributionReport = Fuzz.Internal.noDistribution
+                , failure = Nothing
+                , runsElapsed = state.runsElapsed
+                }
+
+            else if state.runsElapsed < c.runsNeeded then
                 let
                     newState : LoopState
                     newState =
@@ -308,6 +481,9 @@ fuzzLoop c state =
                                         , nextPowerOfTwo = newState.nextPowerOfTwo + 1
                                         , failure = newState.failure
                                         , currentSeed = newState.currentSeed
+                                        , frontier = newState.frontier
+                                        , exhausted = newState.exhausted
+                                        , anyGenerated = newState.anyGenerated
                                         }
 
                                 Just failedLabel ->
@@ -522,7 +698,11 @@ distributionInsufficientFailure failure =
 -}
 runNTimes : Int -> LoopConstants a -> LoopState -> LoopState
 runNTimes times c state =
-    if times <= 0 || state.failure /= Nothing then
+    if times <= 0 || state.failure /= Nothing || state.exhausted then
+        {- Stopping on `exhausted` is what makes early termination actually save
+           anything: without it the batch runs to completion and `fuzzLoop` only
+           notices afterwards, by which point the work is done.
+        -}
         state
 
     else
@@ -534,6 +714,123 @@ and optionally categorize the value.
 -}
 runOnce : LoopConstants a -> LoopState -> LoopState
 runOnce c state =
+    case state.frontier of
+        Just frontier ->
+            runOnceEnumerating c state frontier
+
+        Nothing ->
+            runOnceRandom c state
+
+
+{-| Test the next value in the enumeration of the fuzzer's choice tree.
+
+Falls back to random sampling for the rest of the test as soon as the tree looks
+too wide to finish, and records `exhausted` if it finishes.
+
+-}
+runOnceEnumerating : LoopConstants a -> LoopState -> Frontier -> LoopState
+runOnceEnumerating c state frontier =
+    case Exhaustive.next frontier of
+        Nothing ->
+            {- Only reachable on the very first call, before anything has been
+               generated: the frontier starts empty and the all-zeros run has no
+               prefix. Afterwards an empty frontier means exhausted, which is
+               handled below.
+            -}
+            runEnumeratedPrefix c state frontier []
+
+        Just ( prefix, rest ) ->
+            runEnumeratedPrefix c state rest prefix
+
+
+runEnumeratedPrefix : LoopConstants a -> LoopState -> Frontier -> List Int -> LoopState
+runEnumeratedPrefix c state frontier prefix =
+    let
+        genResult : GenResult a
+        genResult =
+            Fuzz.Internal.generate
+                (PRNG.enumerating (RandomRun.fromList prefix))
+                c.fuzzer
+
+        prng : PRNG.PRNG
+        prng =
+            GenResult.getPrng genResult
+
+        newFrontier : Frontier
+        newFrontier =
+            Exhaustive.enqueue
+                (Exhaustive.expansionsOf
+                    (List.length prefix)
+                    (PRNG.getRun prng)
+                    (PRNG.getMaxes prng)
+                )
+                frontier
+
+        {- An empty frontier after expanding means every choice sequence has been
+           generated: the property holds for the entire input domain, whatever
+           the requested run count was.
+        -}
+        finished : Bool
+        finished =
+            Exhaustive.size newFrontier == 0
+
+        keptFrontier : Maybe Frontier
+        keptFrontier =
+            if
+                finished
+                    || Exhaustive.size newFrontier
+                    > c.frontierCap
+                    || Exhaustive.estimatedTreeSize (c.runsNeeded + 1) (PRNG.getMaxes prng)
+                    > c.runsNeeded
+            then
+                {- Two ways to give up. Frontier width catches trees that branch
+                   in many places; estimated size catches a single draw with a
+                   huge range, which is width 1 and would otherwise have us
+                   enumerate `Fuzz.int` one value at a time.
+                -}
+                Nothing
+
+            else
+                Just newFrontier
+    in
+    case genResult of
+        Rejected _ ->
+            {- Prune rather than fail. Enumeration starts from the smallest
+               choices, which is exactly where `Fuzz.filter` predicates reject,
+               so treating a rejection as an invalid fuzzer would fail tests that
+               are perfectly fine. If *every* node is rejected we say so, which
+               `fuzzLoop` checks via `anyGenerated`.
+            -}
+            { state
+                | frontier = keptFrontier
+                , exhausted = finished
+            }
+
+        Generated { value } ->
+            { state
+                | failure =
+                    case c.testFn value of
+                        Pass _ ->
+                            Nothing
+
+                        Fail { failData } ->
+                            Just <|
+                                findSimplestFailure
+                                    { getExpectation = c.testFn
+                                    , fuzzer = c.fuzzer
+                                    , randomRun = PRNG.getRun prng
+                                    , value = value
+                                    , failData = failData
+                                    }
+                , runsElapsed = state.runsElapsed + 1
+                , frontier = keptFrontier
+                , exhausted = finished
+                , anyGenerated = True
+            }
+
+
+runOnceRandom : LoopConstants a -> LoopState -> LoopState
+runOnceRandom c state =
     let
         genResult : GenResult a
         genResult =
@@ -617,6 +914,9 @@ runOnce c state =
     , currentSeed = nextSeed
     , runsElapsed = state.runsElapsed + 1
     , nextPowerOfTwo = state.nextPowerOfTwo
+    , frontier = state.frontier
+    , exhausted = state.exhausted
+    , anyGenerated = True
     }
 
 

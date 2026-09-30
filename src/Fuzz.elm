@@ -1759,6 +1759,37 @@ rollDice maxValue diceGenerator =
                                     , prng = Hardcoded wholeRun restOfChoices
                                     }
 
+                Enumerating unusedPrefix runSoFar maxesSoFar ->
+                    {- Replay the prefix if there's any left, otherwise take the
+                       smallest choice. Either way record `maxValue`: that's the
+                       branching factor at this position, and without it the
+                       enumerator can't know what alternatives exist.
+                    -}
+                    let
+                        ( choice, restOfPrefix ) =
+                            case RandomRun.nextChoice unusedPrefix of
+                                Just ( fromPrefix, rest ) ->
+                                    ( fromPrefix, rest )
+
+                                Nothing ->
+                                    ( 0, unusedPrefix )
+                    in
+                    if choice > maxValue then
+                        -- The prefix is no longer valid for this fuzzer.
+                        Rejected
+                            { reason = "elm-test internals: enumerated choice > maxChoice"
+                            , prng = prng
+                            }
+
+                    else
+                        Generated
+                            { value = choice
+                            , prng =
+                                Enumerating restOfPrefix
+                                    (RandomRun.append choice runSoFar)
+                                    (RandomRun.append maxValue maxesSoFar)
+                            }
+
 
 forcedChoice : Int -> Fuzzer Int
 forcedChoice n =
@@ -1799,6 +1830,26 @@ forcedChoice n =
                                         { value = n
                                         , prng = Hardcoded wholeRun restOfChoices
                                         }
+
+                    Enumerating unusedPrefix runSoFar maxesSoFar ->
+                        {- A forced choice has no alternatives, so its max is
+                           itself and the enumerator will never try to vary it.
+                           We still consume a prefix element to stay aligned.
+                        -}
+                        Generated
+                            { value = n
+                            , prng =
+                                Enumerating
+                                    (case RandomRun.nextChoice unusedPrefix of
+                                        Just ( _, rest ) ->
+                                            rest
+
+                                        Nothing ->
+                                            unusedPrefix
+                                    )
+                                    (RandomRun.append n runSoFar)
+                                    (RandomRun.append n maxesSoFar)
+                            }
 
 
 {-| We could golf this to ((/=) 0) but this is perhaps more readable.
