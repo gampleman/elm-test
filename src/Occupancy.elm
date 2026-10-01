@@ -6,6 +6,7 @@ module Occupancy exposing
     , isExhausted
     , isOpen
     , markCovered
+    , novelPrefix
     )
 
 {-| What part of a fuzzer's input space has already been covered.
@@ -54,6 +55,7 @@ drawn first. See [`markCovered`](#markCovered) and [`maxDepth`](#maxDepth).
 -}
 
 import Dict exposing (Dict)
+import Random
 import RandomRun exposing (RandomRun)
 import Set exposing (Set)
 
@@ -372,3 +374,116 @@ bitsNeededHelp n acc =
 
     else
         bitsNeededHelp ((n + 1) // 2) (acc + 1)
+
+
+{-| A prefix of choices that has not been taken before, for the next test case to
+start from.
+
+Walks down from the root picking a value at each node, and stops the moment it
+picks one that has never been taken — everything after that point is new, so the
+fuzzer can be left to draw it freely. Covered children are skipped, so the walk
+never descends into a part of the space that is finished.
+
+This is the whole reason there is no per-draw conditioning: the work of avoiding
+already-tested inputs happens once here, before generation, instead of at every
+`rollDice`. It's the approach Hypothesis's `DataTree.generate_novel_prefix` takes.
+
+Two consequences worth being explicit about:
+
+  - **A domain of size `n` is covered in `n` runs, not `n * ln n`.** Nothing is
+    ever tested twice, so there are no duplicates to wait out. That makes early
+    termination optimal and lets [`worthTracking`](#worthTracking) admit much
+    larger domains than it could when coverage relied on chance.
+  - **Values differ from what the same seed produced before.** Picking a novel
+    prefix means not picking what the generator would have. There is no way to
+    have both; this trades seed stability for never repeating an input.
+
+The pick is uniform over a node's uncovered children rather than drawn from that
+node's generator, because the generator isn't recorded in the tree. For the nodes
+that get tracked this is usually exactly right — `oneOf`, `oneOfValues` and
+`intRange` are uniform — but it does flatten `weightedBool`, which is how
+`Fuzz.list` decides whether to continue. Storing each node's generator (as
+Hypothesis stores its constraints) would fix that.
+
+-}
+novelPrefix : Random.Seed -> Occupancy -> ( List Int, Random.Seed )
+novelPrefix seed occupancy =
+    novelPrefixHelp seed maxDepth occupancy []
+
+
+novelPrefixHelp : Random.Seed -> Int -> Occupancy -> List Int -> ( List Int, Random.Seed )
+novelPrefixHelp seed depthLeft occupancy reversedPrefix =
+    case occupancy of
+        Partial maxValue children covered ->
+            if depthLeft <= 0 || Dict.isEmpty children || Set.size covered > maxValue then
+                {- Nothing recorded at this node yet, so whatever the fuzzer draws
+                   here is already novel and there is no reason to force anything.
+                   That also keeps us away from the placeholder bound that `empty`
+                   carries before the first draw is observed.
+                -}
+                ( List.reverse reversedPrefix, seed )
+
+            else
+                let
+                    ( value, newSeed ) =
+                        pickUncovered covered maxValue seed
+                in
+                case Dict.get value children of
+                    Nothing ->
+                        -- Never taken, so everything from here on is new.
+                        ( List.reverse (value :: reversedPrefix), newSeed )
+
+                    Just child ->
+                        novelPrefixHelp newSeed (depthLeft - 1) child (value :: reversedPrefix)
+
+        Open ->
+            ( List.reverse reversedPrefix, seed )
+
+        Covered ->
+            -- The caller checks for an exhausted root before asking.
+            ( List.reverse reversedPrefix, seed )
+
+
+{-| Pick a child that isn't covered.
+
+Rejection first, since with a mostly-uncovered node it succeeds immediately, then
+an exact scan. Unlike the old per-draw conditioning this runs once per test case,
+so the scan's `O(width)` is affordable — and it is only safe at all because a
+tracked node is always `Dense`, so every value in range is one its generator could
+produce.
+
+-}
+pickUncovered : Set Int -> Int -> Random.Seed -> ( Int, Random.Seed )
+pickUncovered covered maxValue seed =
+    if Set.isEmpty covered then
+        Random.step (Random.int 0 maxValue) seed
+
+    else
+        pickUncoveredHelp covered maxValue seed 8
+
+
+pickUncoveredHelp : Set Int -> Int -> Random.Seed -> Int -> ( Int, Random.Seed )
+pickUncoveredHelp covered maxValue seed attemptsLeft =
+    let
+        ( value, newSeed ) =
+            Random.step (Random.int 0 maxValue) seed
+    in
+    if not (Set.member value covered) then
+        ( value, newSeed )
+
+    else if attemptsLeft <= 0 then
+        case List.filter (\v -> not (Set.member v covered)) (List.range 0 maxValue) of
+            [] ->
+                ( value, newSeed )
+
+            remaining ->
+                let
+                    ( index, finalSeed ) =
+                        Random.step (Random.int 0 (List.length remaining - 1)) newSeed
+                in
+                ( remaining |> List.drop index |> List.head |> Maybe.withDefault value
+                , finalSeed
+                )
+
+    else
+        pickUncoveredHelp covered maxValue newSeed (attemptsLeft - 1)

@@ -1,4 +1,4 @@
-module PRNG exposing (PRNG(..), getMaxes, getRun, getSeed, hardcoded, random, tracked)
+module PRNG exposing (PRNG(..), getMaxes, getRun, getSeed, hardcoded, random, recording)
 
 {-| A way to draw values. There are two ways:
 
@@ -9,17 +9,16 @@ module PRNG exposing (PRNG(..), getMaxes, getRun, getSeed, hardcoded, random, tr
     when reproducing a failure. This can run out of values to draw, but that
     shouldn't happen during the normal execution.
 
-3.  Tracked: like Random, but carrying a record of which parts of the input
-    space have already been covered, so a draw can decline them. Also records
-    the upper bound of every draw, which is what tells `Occupancy` how many
-    children a node has and therefore when it's complete.
+3.  Recording: replay a prefix of choices, then draw randomly, recording the
+    upper bound of every draw as we go. The bounds are what tell `Occupancy` how
+    many children a node has and therefore when it is complete.
 
-    Until something is actually covered this behaves exactly like Random: the
-    same seed produces the same values.
+    The prefix comes from `Occupancy.novelPrefix`, which picks one that has not
+    been taken before. So the work of avoiding already-tested inputs happens once
+    per test case, before generation, rather than at every single draw.
 
 -}
 
-import Occupancy exposing (Occupancy)
 import Random
 import RandomRun exposing (RandomRun)
 
@@ -28,7 +27,7 @@ type PRNG
     = -- PERF: optimized from record to custom type arguments to skip _Utils_update:
       Random RandomRun Random.Seed
     | Hardcoded {- wholeRun: -} RandomRun {- unusedPart: -} RandomRun
-    | Tracked {- hereOnwards: -} Occupancy {- run: -} RandomRun {- reversedMaxes: -} (List Int) Random.Seed
+    | Recording {- unusedPrefix: -} RandomRun {- run: -} RandomRun {- reversedMaxes: -} (List Int) Random.Seed
 
 
 random : Random.Seed -> PRNG
@@ -41,11 +40,11 @@ hardcoded run =
     Hardcoded run run
 
 
-{-| Draw randomly, declining inputs already covered.
+{-| Replay `prefix`, then draw randomly, recording bounds throughout.
 -}
-tracked : Occupancy -> Random.Seed -> PRNG
-tracked occupancy seed =
-    Tracked occupancy RandomRun.empty [] seed
+recording : RandomRun -> Random.Seed -> PRNG
+recording prefix seed =
+    Recording prefix RandomRun.empty [] seed
 
 
 getRun : PRNG -> RandomRun
@@ -57,7 +56,7 @@ getRun prng =
         Hardcoded wholeRun _ ->
             wholeRun
 
-        Tracked _ run _ _ ->
+        Recording _ run _ _ ->
             run
 
 
@@ -70,7 +69,7 @@ getSeed prng =
         Hardcoded _ _ ->
             Nothing
 
-        Tracked _ _ _ seed ->
+        Recording _ _ _ seed ->
             Just seed
 
 
@@ -92,5 +91,5 @@ getMaxes prng =
         Hardcoded _ _ ->
             []
 
-        Tracked _ _ reversedMaxes _ ->
+        Recording _ _ reversedMaxes _ ->
             List.reverse reversedMaxes

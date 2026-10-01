@@ -555,10 +555,16 @@ and optionally categorize the value.
 runOnce : LoopConstants a -> LoopState -> LoopState
 runOnce c state =
     let
+        {- Choose a starting point no earlier run has taken, then let the fuzzer
+           draw the rest. Done once here rather than at every draw.
+        -}
+        ( prefix, seedAfterPrefix ) =
+            Occupancy.novelPrefix state.currentSeed state.occupancy
+
         genResult : GenResult a
         genResult =
             Fuzz.Internal.generate
-                (PRNG.tracked state.occupancy state.currentSeed)
+                (PRNG.recording (RandomRun.fromList prefix) seedAfterPrefix)
                 c.fuzzer
 
         maybeNextSeed : Maybe Random.Seed
